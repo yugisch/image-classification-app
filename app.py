@@ -359,8 +359,9 @@ def train_model(model_name, epochs1, epochs2, batch_size, progress=gr.Progress()
 {report}
 ```
 """
+    model_path = str(Path(DATASET_ROOT) / "best_model.pth")
     progress(1.0, desc="Done")
-    return summary, fig_acc, fig_cm, f"✓ {model_name} · {final_acc:.2f}%"
+    return summary, fig_acc, fig_cm, f"✓ {model_name} · {final_acc:.2f}%", model_path
 
 
 def predict_image(image, progress=gr.Progress()):
@@ -419,6 +420,45 @@ def predict_image(image, progress=gr.Progress()):
 
     progress(1.0, desc="Done")
     return f"### {pred}\n**{confidence:.1f}%** confidence", fig
+
+
+
+def load_model(model_file, progress=gr.Progress()):
+    global CURRENT_MODEL, CLASS_NAMES
+
+    if model_file is None:
+        raise gr.Error("Please upload a .pth model file.")
+
+    progress(0.3, desc="Loading model...")
+
+    try:
+        checkpoint = torch.load(model_file, map_location=DEVICE, weights_only=False)
+    except Exception as e:
+        raise gr.Error(f"Failed to load model: {e}")
+
+    if "class_names" not in checkpoint or "model_state" not in checkpoint:
+        raise gr.Error("Invalid model file. Please use a model exported from this app.")
+
+    class_names = checkpoint["class_names"]
+    model_name = checkpoint.get("model_name", "EfficientNet-B0")
+    accuracy = checkpoint.get("accuracy", None)
+
+    if model_name not in MODEL_MAP:
+        model_name = "EfficientNet-B0"
+
+    progress(0.6, desc=f"Building {model_name}...")
+    model = build_model(model_name, len(class_names))
+    model.load_state_dict(checkpoint["model_state"])
+    model.eval()
+
+    CURRENT_MODEL = model
+    CLASS_NAMES = class_names
+
+    progress(1.0, desc="Done")
+
+    acc_text = f" · Acc {accuracy:.2f}%" if accuracy is not None else ""
+    status = f"✓ Loaded {model_name} ({len(class_names)} classes){acc_text}"
+    return status, f"**Model loaded successfully**\n\n- Model: `{model_name}`\n- Classes: {', '.join(class_names)}\n- Ready for prediction"
 
 
 # ====================== UI ======================
@@ -500,6 +540,15 @@ with gr.Blocks(
                 batch_size = gr.Slider(8, 64, value=32, step=8, label="Batch Size")
                 train_btn = gr.Button("Start Training", variant="primary", size="lg")
 
+            with gr.Group():
+                gr.Markdown("#### Load Model")
+                model_upload = gr.File(
+                    label="Upload trained model (.pth)",
+                    file_types=[".pth"],
+                    type="filepath"
+                )
+                load_btn = gr.Button("Load Model", variant="secondary")
+
             with gr.Accordion("Notes", open=True):
                 gr.Markdown("""
 - **EfficientNet-B0** → best speed / quality (recommended)
@@ -508,6 +557,7 @@ with gr.Blocks(
 - Stage 2: fine-tune last blocks
 - Class imbalance handled automatically
 - 4 GB VRAM → use B0/B1, batch ≤ 32
+- After training you can download the model and load it later
                 """)
 
         # RIGHT
@@ -518,6 +568,7 @@ with gr.Blocks(
                 dataset_summary = gr.Markdown("*Analyze a folder to begin*")
                 train_status = gr.Markdown("")
                 model_status = gr.Textbox(label="Model", value="No model yet", interactive=False)
+                model_download = gr.File(label="Download Trained Model", interactive=False)
 
                 with gr.Row():
                     acc_plot = gr.Plot(label="Accuracy")
@@ -548,7 +599,13 @@ with gr.Blocks(
     train_btn.click(
         fn=train_model,
         inputs=[model_choice, epochs1, epochs2, batch_size],
-        outputs=[train_status, acc_plot, cm_plot, model_status]
+        outputs=[train_status, acc_plot, cm_plot, model_status, model_download]
+    )
+
+    load_btn.click(
+        fn=load_model,
+        inputs=[model_upload],
+        outputs=[model_status, train_status]
     )
 
     predict_btn.click(
