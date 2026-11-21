@@ -439,23 +439,23 @@ footer {display:none !important;}
 }
 """
 
+theme = gr.themes.Base(
+    primary_hue="violet",
+    neutral_hue="slate",
+    font=[gr.themes.GoogleFont("Inter"), "system-ui", "sans-serif"],
+).set(
+    body_background_fill="#080c18",
+    body_background_fill_dark="#080c18",
+    block_background_fill="#0f172a",
+    block_background_fill_dark="#0f172a",
+    border_color_primary="#1e293b",
+    border_color_primary_dark="#1e293b",
+    button_primary_background_fill="#7c3aed",
+    button_primary_background_fill_hover="#6d28d9",
+)
+
 with gr.Blocks(
     title="Image Classification",
-    theme=gr.themes.Base(
-        primary_hue="violet",
-        neutral_hue="slate",
-        font=[gr.themes.GoogleFont("Inter"), "system-ui", "sans-serif"],
-    ).set(
-        body_background_fill="#080c18",
-        body_background_fill_dark="#080c18",
-        block_background_fill="#0f172a",
-        block_background_fill_dark="#0f172a",
-        border_color_primary="#1e293b",
-        border_color_primary_dark="#1e293b",
-        button_primary_background_fill="#7c3aed",
-        button_primary_background_fill_hover="#6d28d9",
-    ),
-    css=css,
     fill_width=True
 ) as demo:
 
@@ -535,7 +535,7 @@ with gr.Blocks(
     gr.Markdown("""
     <div style="text-align:center; color:#475569; font-size:0.78rem; margin-top:24px; padding-bottom:12px;">
         Made by <a href="https://github.com/yugisch" target="_blank" style="color:#818cf8;">yugisch</a>
-        · Runs fully locally
+        · Built with Grok · Runs fully locally
     </div>
     """)
 
@@ -559,4 +559,4 @@ with gr.Blocks(
 
 
 if __name__ == "__main__":
-    demo.queue().launch(server_name="0.0.0.0", server_port=7860, share=False)
+    demo.queue().launch(server_name="0.0.0.0", server_port=7860, share=False, theme=theme, css=css)
