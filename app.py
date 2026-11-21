@@ -47,26 +47,11 @@ def get_device_info():
     return "CPU only (training will be slow)"
 
 
-def on_folder_selected(files):
-    """Extract folder path from directory selection"""
-    if files is None:
-        return "", "No folder selected"
-
-    if isinstance(files, list) and len(files) > 0:
-        first = Path(files[0].name if hasattr(files[0], "name") else files[0])
-        # The parent of the first file is usually the selected folder
-        folder = str(first.parent)
-        return folder, f"Selected: {folder}"
-
-    folder = str(files)
-    return folder, f"Selected: {folder}"
-
-
 def analyze_folder(folder_path, progress=gr.Progress()):
     global DATASET_ROOT, CLASS_NAMES
 
     if not folder_path or not str(folder_path).strip():
-        raise gr.Error("Please select a folder first.")
+        raise gr.Error("Please enter a folder path.")
 
     folder_path = str(folder_path).strip().strip('"').strip("'")
     root = Path(folder_path)
@@ -489,28 +474,16 @@ with gr.Blocks(
 
     with gr.Row(elem_classes=["main-row"], equal_height=False):
 
-        # LEFT ~25%
+        # LEFT
         with gr.Column(scale=1, min_width=320):
 
             with gr.Group():
                 gr.Markdown("#### Dataset")
-
-                folder_picker = gr.File(
-                    label="Select Dataset Folder",
-                    file_count="directory",
-                    type="filepath",
-                    height=140
+                folder_input = gr.Textbox(
+                    label="Folder path",
+                    placeholder=r"D:\Datasets\my_dataset",
+                    lines=1
                 )
-
-                selected_path = gr.Textbox(
-                    label="Selected Folder",
-                    interactive=False,
-                    placeholder="No folder selected yet"
-                )
-
-                # Hidden state to keep the actual path
-                folder_path_state = gr.State("")
-
                 analyze_btn = gr.Button("Analyze Folder", variant="primary")
                 dataset_status = gr.Textbox(label="Status", value="No dataset loaded", interactive=False)
 
@@ -537,7 +510,7 @@ with gr.Blocks(
 - 4 GB VRAM → use B0/B1, batch ≤ 32
                 """)
 
-        # RIGHT ~75%
+        # RIGHT
         with gr.Column(scale=3):
 
             with gr.Group():
@@ -566,16 +539,9 @@ with gr.Blocks(
     </div>
     """)
 
-    # When folder is selected → update path display + state
-    folder_picker.change(
-        fn=on_folder_selected,
-        inputs=[folder_picker],
-        outputs=[folder_path_state, selected_path]
-    )
-
     analyze_btn.click(
         fn=analyze_folder,
-        inputs=[folder_path_state],
+        inputs=[folder_input],
         outputs=[dataset_summary, dataset_status]
     )
 

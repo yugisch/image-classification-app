@@ -8,7 +8,7 @@ Works with any classes (emotions, cars, animals, gender, etc.) as long as your f
 
 ## Features
 
-- Select a local dataset folder (no need to zip)
+- Copy and Paste the local dataset folder (no need to zip)
 - Choose between EfficientNet-B0 / B1 / B2 / B3
 - Two-stage transfer learning (Stage 1 + Stage 2)
 - Automatic class imbalance handling
@@ -118,7 +118,7 @@ Open your browser and go to:
 ## How to Use
 
 1. **Dataset tab (left side)**
-   - Click the folder selector and choose your dataset folder
+   - Copy paste the location of your dataset folder
    - Click **Analyze Folder**
 
 2. **Training Settings**
