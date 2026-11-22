@@ -1,464 +1,185 @@
-import copy
-from pathlib import Path
-from collections import Counter
+"""
+app.py
+------
+Gradio UI for the Image Classification app.
+All heavy logic lives in training.py, cleaning.py and utils.py.
+"""
 
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, WeightedRandomSampler
-from torchvision import datasets, transforms, models
-from torchvision.models import (
-    EfficientNet_B0_Weights, EfficientNet_B1_Weights,
-    EfficientNet_B2_Weights, EfficientNet_B3_Weights
-)
-from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
-import matplotlib.pyplot as plt
-import seaborn as sns
-from PIL import Image
 import gradio as gr
+from pathlib import Path
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-NUM_WORKERS = 2
-SEED = 42
+from utils import (
+    get_device_info, find_dataset_root, analyze_dataset,
+    load_last_folder, save_last_folder,
+    export_results_csv, export_results_pdf
+)
+from training import train_model, load_checkpoint, predict, MODEL_MAP
+from cleaning import find_label_issues, create_cleaned_dataset
 
-torch.manual_seed(SEED)
-np.random.seed(SEED)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed_all(SEED)
-
+# Global state
 CURRENT_MODEL = None
 CLASS_NAMES = None
 DATASET_ROOT = None
-
-MODEL_MAP = {
-    "EfficientNet-B0": (models.efficientnet_b0, EfficientNet_B0_Weights.IMAGENET1K_V1),
-    "EfficientNet-B1": (models.efficientnet_b1, EfficientNet_B1_Weights.IMAGENET1K_V1),
-    "EfficientNet-B2": (models.efficientnet_b2, EfficientNet_B2_Weights.IMAGENET1K_V1),
-    "EfficientNet-B3": (models.efficientnet_b3, EfficientNet_B3_Weights.IMAGENET1K_V1),
-}
+LAST_RESULTS = None
 
 
-def get_device_info():
-    if torch.cuda.is_available():
-        name = torch.cuda.get_device_name(0)
-        vram = torch.cuda.get_device_properties(0).total_memory / 1024**3
-        return f"{name}  ·  {vram:.1f} GB"
-    return "CPU only (training will be slow)"
-
-
-def analyze_folder(folder_path, progress=gr.Progress()):
-    global DATASET_ROOT, CLASS_NAMES
+def ui_analyze_folder(folder_path, progress=gr.Progress()):
+    """Analyze dataset folder and show statistics."""
+    global DATASET_ROOT
 
     if not folder_path or not str(folder_path).strip():
         raise gr.Error("Please enter a folder path.")
 
-    folder_path = str(folder_path).strip().strip('"').strip("'")
-    root = Path(folder_path)
-
-    if not root.exists():
-        raise gr.Error(f"Folder not found:\n{root}")
-
-    train_dir = root / "train"
-    test_dir = root / "test"
-
-    if not train_dir.exists():
-        candidates = list(root.rglob("train"))
-        if candidates:
-            train_dir = min(candidates, key=lambda p: len(str(p)))
-            root = train_dir.parent
-            test_dir = root / "test"
-
-    if not train_dir.exists() or not test_dir.exists():
-        raise gr.Error("Could not find 'train' and 'test' folders.")
-
-    progress(0.4, desc="Scanning classes...")
-
-    classes = sorted([d.name for d in train_dir.iterdir() if d.is_dir()])
-    if not classes:
-        raise gr.Error("No class folders found inside train/.")
-
-    train_counts, test_counts = {}, {}
-    total_train = total_test = 0
-
-    for cls in classes:
-        n_train = len(list((train_dir / cls).glob("*.*")))
-        n_test = len(list((test_dir / cls).glob("*.*")))
-        train_counts[cls] = n_train
-        test_counts[cls] = n_test
-        total_train += n_train
-        total_test += n_test
-
-    DATASET_ROOT = str(root)
-    CLASS_NAMES = classes
-
-    lines = [
-        f"**Dataset ready**",
-        f"",
-        f"`{root}`",
-        f"",
-        f"**{len(classes)} classes** · **{total_train + total_test:,} images**",
-        f"",
-        f"| Class | Train | Test |",
-        f"|-------|------:|-----:|",
-    ]
-    for cls in classes:
-        lines.append(f"| {cls} | {train_counts[cls]:,} | {test_counts[cls]:,} |")
-
-    if train_counts:
-        max_c = max(train_counts.values())
-        min_c = min(train_counts.values())
-        if max_c / max(min_c, 1) > 4:
-            lines.append("")
-            lines.append("⚠️ Imbalanced dataset — class weights will be used.")
-
-    progress(1.0, desc="Done")
-    return "\n".join(lines), f"✓ {len(classes)} classes · {total_train + total_test:,} images"
+    try:
+        root = find_dataset_root(folder_path)
+        summary, stats = analyze_dataset(root)
+        DATASET_ROOT = str(root)
+        save_last_folder(str(root))
+        status = f"✓ {len(stats['classes'])} classes · {stats['total_train'] + stats['total_test']:,} images"
+        return summary, status
+    except Exception as e:
+        raise gr.Error(str(e))
 
 
-def get_transforms(img_size=224):
-    train_tf = transforms.Compose([
-        transforms.Grayscale(num_output_channels=3),
-        transforms.Resize((img_size, img_size)),
-        transforms.RandomHorizontalFlip(p=0.5),
-        transforms.RandomRotation(12),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2),
-        transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-    ])
-    val_tf = transforms.Compose([
-        transforms.Grayscale(num_output_channels=3),
-        transforms.Resize((img_size, img_size)),
-        transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-    ])
-    return train_tf, val_tf
-
-
-def build_model(model_name, num_classes):
-    ctor, weights = MODEL_MAP[model_name]
-    model = ctor(weights=weights)
-    for param in model.parameters():
-        param.requires_grad = False
-    in_features = model.classifier[1].in_features
-    model.classifier = nn.Sequential(
-        nn.Dropout(p=0.3, inplace=True),
-        nn.Linear(in_features, num_classes)
-    )
-    return model.to(DEVICE)
-
-
-def plot_cm(cm, class_names):
-    fig, ax = plt.subplots(figsize=(6.5, 5), facecolor="#0c1222")
-    ax.set_facecolor("#0c1222")
-    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
-                xticklabels=class_names, yticklabels=class_names, ax=ax,
-                cbar_kws={"shrink": 0.75})
-    ax.set_xlabel("Predicted", color="#cbd5e1")
-    ax.set_ylabel("True", color="#cbd5e1")
-    ax.set_title("Confusion Matrix", color="#f1f5f9", pad=10)
-    ax.tick_params(colors="#94a3b8")
-    plt.tight_layout()
-    return fig
-
-
-def train_model(model_name, epochs1, epochs2, batch_size, progress=gr.Progress()):
+def ui_train(model_name, epochs1, epochs2, batch_size, progress=gr.Progress()):
+    """Train a model on the current dataset."""
     global CURRENT_MODEL, CLASS_NAMES, DATASET_ROOT
 
     if not DATASET_ROOT:
         raise gr.Error("Please analyze a dataset folder first.")
 
-    root = Path(DATASET_ROOT)
-    img_size = 224
-    if "B2" in model_name:
-        img_size = 260
-    elif "B3" in model_name:
-        img_size = 300
+    def cb(pct, desc):
+        progress(pct, desc=desc)
 
-    train_tf, val_tf = get_transforms(img_size)
+    result = train_model(
+        dataset_root=DATASET_ROOT,
+        model_name=model_name,
+        epochs_stage1=int(epochs1),
+        epochs_stage2=int(epochs2),
+        batch_size=int(batch_size),
+        progress_callback=cb
+    )
 
-    progress(0.03, desc="Loading dataset...")
-    train_ds = datasets.ImageFolder(root / "train", transform=train_tf)
-    test_ds = datasets.ImageFolder(root / "test", transform=val_tf)
+    CURRENT_MODEL = result["model"]
+    CLASS_NAMES = result["class_names"]
 
-    CLASS_NAMES = train_ds.classes
-    num_classes = len(CLASS_NAMES)
+    global LAST_RESULTS
+    LAST_RESULTS = result
 
-    targets = train_ds.targets
-    counts = Counter(targets)
-    weights = torch.tensor([1.0 / counts[i] for i in range(num_classes)], dtype=torch.float)
-    sampler = WeightedRandomSampler([weights[t] for t in targets], len(targets), replacement=True)
-
-    train_loader = DataLoader(train_ds, batch_size=int(batch_size), sampler=sampler,
-                              num_workers=NUM_WORKERS, pin_memory=torch.cuda.is_available())
-    test_loader = DataLoader(test_ds, batch_size=int(batch_size)*2, shuffle=False,
-                             num_workers=NUM_WORKERS, pin_memory=torch.cuda.is_available())
-
-    progress(0.06, desc=f"Building {model_name}...")
-    model = build_model(model_name, num_classes)
-    criterion = nn.CrossEntropyLoss(weight=weights.to(DEVICE))
-    scaler = torch.amp.GradScaler("cuda") if torch.cuda.is_available() else None
-
-    optimizer = optim.AdamW(model.classifier.parameters(), lr=1e-3, weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=int(epochs1))
-    best_acc, best_wts = 0.0, copy.deepcopy(model.state_dict())
-    history = {"train": [], "val": []}
-    total_ep = int(epochs1) + int(epochs2)
-
-    for ep in range(1, int(epochs1)+1):
-        model.train()
-        correct = total = 0
-        for x, y in train_loader:
-            x, y = x.to(DEVICE, non_blocking=True), y.to(DEVICE, non_blocking=True)
-            optimizer.zero_grad(set_to_none=True)
-            if scaler:
-                with torch.amp.autocast("cuda"):
-                    out = model(x)
-                    loss = criterion(out, y)
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                out = model(x)
-                loss = criterion(out, y)
-                loss.backward()
-                optimizer.step()
-            _, pred = out.max(1)
-            total += y.size(0)
-            correct += pred.eq(y).sum().item()
-        train_acc = 100 * correct / total
-        scheduler.step()
-
-        model.eval()
-        v_correct = v_total = 0
-        with torch.no_grad():
-            for x, y in test_loader:
-                x, y = x.to(DEVICE, non_blocking=True), y.to(DEVICE, non_blocking=True)
-                if scaler:
-                    with torch.amp.autocast("cuda"):
-                        out = model(x)
-                else:
-                    out = model(x)
-                _, pred = out.max(1)
-                v_total += y.size(0)
-                v_correct += pred.eq(y).sum().item()
-        val_acc = 100 * v_correct / v_total
-        history["train"].append(train_acc)
-        history["val"].append(val_acc)
-        if val_acc > best_acc:
-            best_acc = val_acc
-            best_wts = copy.deepcopy(model.state_dict())
-        progress(0.06 + (ep / total_ep) * 0.55, desc=f"Stage 1 · {ep}/{int(epochs1)} · Val {val_acc:.1f}%")
-
-    model.load_state_dict(best_wts)
-    for name, param in model.named_parameters():
-        if any(k in name for k in ["features.6", "features.7", "features.8", "classifier"]):
-            param.requires_grad = True
-        else:
-            param.requires_grad = False
-
-    optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4, weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=int(epochs2))
-
-    for ep in range(1, int(epochs2)+1):
-        model.train()
-        correct = total = 0
-        for x, y in train_loader:
-            x, y = x.to(DEVICE, non_blocking=True), y.to(DEVICE, non_blocking=True)
-            optimizer.zero_grad(set_to_none=True)
-            if scaler:
-                with torch.amp.autocast("cuda"):
-                    out = model(x)
-                    loss = criterion(out, y)
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                out = model(x)
-                loss = criterion(out, y)
-                loss.backward()
-                optimizer.step()
-            _, pred = out.max(1)
-            total += y.size(0)
-            correct += pred.eq(y).sum().item()
-        train_acc = 100 * correct / total
-        scheduler.step()
-
-        model.eval()
-        preds, labels = [], []
-        with torch.no_grad():
-            for x, y in test_loader:
-                x, y = x.to(DEVICE, non_blocking=True), y.to(DEVICE, non_blocking=True)
-                if scaler:
-                    with torch.amp.autocast("cuda"):
-                        out = model(x)
-                else:
-                    out = model(x)
-                _, pred = out.max(1)
-                preds.extend(pred.cpu().numpy())
-                labels.extend(y.cpu().numpy())
-        val_acc = accuracy_score(labels, preds) * 100
-        history["train"].append(train_acc)
-        history["val"].append(val_acc)
-        if val_acc > best_acc:
-            best_acc = val_acc
-            best_wts = copy.deepcopy(model.state_dict())
-        progress(0.62 + (ep / int(epochs2)) * 0.32, desc=f"Stage 2 · {ep}/{int(epochs2)} · Val {val_acc:.1f}%")
-
-    progress(0.96, desc="Final evaluation...")
-    model.load_state_dict(best_wts)
-    model.eval()
-    preds, labels = [], []
-    with torch.no_grad():
-        for x, y in test_loader:
-            x, y = x.to(DEVICE, non_blocking=True), y.to(DEVICE, non_blocking=True)
-            if scaler:
-                with torch.amp.autocast("cuda"):
-                    out = model(x)
-            else:
-                out = model(x)
-            _, pred = out.max(1)
-            preds.extend(pred.cpu().numpy())
-            labels.extend(y.cpu().numpy())
-
-    final_acc = accuracy_score(labels, preds) * 100
-    report = classification_report(labels, preds, target_names=CLASS_NAMES, digits=3)
-    cm = confusion_matrix(labels, preds)
-
-    CURRENT_MODEL = model
-
-    torch.save({
-        "model_state": model.state_dict(),
-        "class_names": CLASS_NAMES,
-        "model_name": model_name,
-        "accuracy": final_acc
-    }, Path(DATASET_ROOT) / "best_model.pth")
-
-    fig_acc, ax = plt.subplots(figsize=(7, 3.8), facecolor="#0c1222")
-    ax.set_facecolor("#0c1222")
-    ax.plot(history["train"], label="Train", color="#60a5fa", lw=2)
-    ax.plot(history["val"], label="Val", color="#34d399", lw=2)
-    ax.set_xlabel("Epoch", color="#94a3b8")
-    ax.set_ylabel("Accuracy %", color="#94a3b8")
-    ax.set_title("Training Curve", color="#f1f5f9", pad=8)
-    ax.legend(facecolor="#1e293b", edgecolor="#334155", labelcolor="#e2e8f0")
-    ax.tick_params(colors="#94a3b8")
-    ax.grid(True, alpha=0.12)
-    for s in ax.spines.values():
-        s.set_color("#334155")
-    plt.tight_layout()
-
-    fig_cm = plot_cm(cm, CLASS_NAMES)
-
-    summary = f"""### Training Finished
-
-**Model:** {model_name}  
-**Accuracy:** **{final_acc:.2f}%**
-
-```
-{report}
-```
-"""
-    model_path = str(Path(DATASET_ROOT) / "best_model.pth")
-    progress(1.0, desc="Done")
-    return summary, fig_acc, fig_cm, f"✓ {model_name} · {final_acc:.2f}%", model_path
+    return (
+        result["summary"],
+        result["fig_acc"],
+        result["fig_cm"],
+        result["status"],
+        result["model_path"]
+    )
 
 
-def predict_image(image, progress=gr.Progress()):
-    global CURRENT_MODEL, CLASS_NAMES
-
-    if CURRENT_MODEL is None or CLASS_NAMES is None:
-        raise gr.Error("Train a model first.")
-
-    if image is None:
-        raise gr.Error("Upload an image.")
-
-    progress(0.3, desc="Preprocessing...")
-    tf = transforms.Compose([
-        transforms.Grayscale(num_output_channels=3),
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-    ])
-
-    if isinstance(image, np.ndarray):
-        image = Image.fromarray(image.astype("uint8")).convert("RGB")
-    else:
-        image = image.convert("RGB")
-
-    x = tf(image).unsqueeze(0).to(DEVICE)
-
-    progress(0.7, desc="Predicting...")
-    CURRENT_MODEL.eval()
-    with torch.no_grad():
-        if torch.cuda.is_available():
-            with torch.amp.autocast("cuda"):
-                out = CURRENT_MODEL(x)
-        else:
-            out = CURRENT_MODEL(x)
-        probs = torch.softmax(out, dim=1)[0]
-        conf, idx = torch.max(probs, 0)
-
-    pred = CLASS_NAMES[idx.item()]
-    confidence = conf.item() * 100
-    probs_np = probs.cpu().numpy()
-
-    fig, ax = plt.subplots(figsize=(6.5, 3.8), facecolor="#0c1222")
-    ax.set_facecolor("#0c1222")
-    colors = ["#34d399" if i == idx.item() else "#3b82f6" for i in range(len(CLASS_NAMES))]
-    bars = ax.barh(CLASS_NAMES, probs_np * 100, color=colors, height=0.55)
-    ax.set_xlim(0, 100)
-    ax.set_xlabel("Confidence %", color="#94a3b8")
-    ax.set_title(f"{pred}  ·  {confidence:.1f}%", color="#f1f5f9", pad=10)
-    ax.tick_params(colors="#94a3b8")
-    for s in ax.spines.values():
-        s.set_color("#334155")
-    for bar, p in zip(bars, probs_np):
-        ax.text(p*100 + 1.2, bar.get_y() + bar.get_height()/2, f"{p*100:.1f}%",
-                va="center", color="#e2e8f0", fontsize=9)
-    plt.tight_layout()
-
-    progress(1.0, desc="Done")
-    return f"### {pred}\n**{confidence:.1f}%** confidence", fig
-
-
-
-def load_model(model_file, progress=gr.Progress()):
+def ui_load_model(model_file, progress=gr.Progress()):
+    """Load a previously saved .pth model."""
     global CURRENT_MODEL, CLASS_NAMES
 
     if model_file is None:
         raise gr.Error("Please upload a .pth model file.")
 
     progress(0.3, desc="Loading model...")
-
     try:
-        checkpoint = torch.load(model_file, map_location=DEVICE, weights_only=False)
+        model, class_names, model_name, accuracy = load_checkpoint(model_file)
+        CURRENT_MODEL = model
+        CLASS_NAMES = class_names
+
+        acc_text = f" · Acc {accuracy:.2f}%" if accuracy is not None else ""
+        status = f"✓ Loaded {model_name} ({len(class_names)} classes){acc_text}"
+        info = f"**Model loaded successfully**\n\n- Model: `{model_name}`\n- Classes: {', '.join(class_names)}\n- Ready for prediction"
+
+        progress(1.0, desc="Done")
+        return status, info
     except Exception as e:
-        raise gr.Error(f"Failed to load model: {e}")
+        raise gr.Error(str(e))
 
-    if "class_names" not in checkpoint or "model_state" not in checkpoint:
-        raise gr.Error("Invalid model file. Please use a model exported from this app.")
 
-    class_names = checkpoint["class_names"]
-    model_name = checkpoint.get("model_name", "EfficientNet-B0")
-    accuracy = checkpoint.get("accuracy", None)
+def ui_predict(image, progress=gr.Progress()):
+    """Predict class of an uploaded image."""
+    global CURRENT_MODEL, CLASS_NAMES
 
-    if model_name not in MODEL_MAP:
-        model_name = "EfficientNet-B0"
+    if CURRENT_MODEL is None or CLASS_NAMES is None:
+        raise gr.Error("Train or load a model first.")
+    if image is None:
+        raise gr.Error("Please upload an image.")
 
-    progress(0.6, desc=f"Building {model_name}...")
-    model = build_model(model_name, len(class_names))
-    model.load_state_dict(checkpoint["model_state"])
-    model.eval()
+    progress(0.4, desc="Predicting...")
+    result_text, fig = predict(CURRENT_MODEL, CLASS_NAMES, image)
+    progress(1.0, desc="Done")
+    return result_text, fig
 
-    CURRENT_MODEL = model
-    CLASS_NAMES = class_names
+
+def ui_cleanlab(scope, progress=gr.Progress()):
+    """Run Cleanlab (or fallback) and create a cleaned dataset."""
+    global CURRENT_MODEL, DATASET_ROOT
+
+    if CURRENT_MODEL is None:
+        raise gr.Error("Please train a model first (Cleanlab needs a trained model).")
+    if not DATASET_ROOT:
+        raise gr.Error("Please analyze a dataset folder first.")
+
+    def cb(pct, desc):
+        progress(pct, desc=desc)
+
+    # 1. Find issues
+    issues = find_label_issues(
+        model=CURRENT_MODEL,
+        dataset_root=DATASET_ROOT,
+        scope=scope,
+        progress_callback=cb
+    )
+
+    if issues["total_issues"] == 0:
+        return "**No suspicious images found.** Your labels look clean!", ""
+
+    # 2. Create cleaned dataset
+    cleaned_path, summary = create_cleaned_dataset(
+        dataset_root=DATASET_ROOT,
+        issues=issues,
+        progress_callback=cb
+    )
+
+    return summary, cleaned_path
+
+
+
+def ui_export(format_choice, progress=gr.Progress()):
+    """Export last training results as CSV or PDF."""
+    global LAST_RESULTS
+    if LAST_RESULTS is None:
+        raise gr.Error("No training results to export. Train a model first.")
+
+    progress(0.3, desc="Exporting...")
+    summary = LAST_RESULTS["summary"]
+    accuracy = LAST_RESULTS.get("accuracy", 0.0)
+    fig_acc = LAST_RESULTS.get("fig_acc")
+    fig_cm = LAST_RESULTS.get("fig_cm")
+
+    # Extract report text roughly
+    report_text = summary
+
+    if format_choice == "CSV":
+        path = export_results_csv(
+            class_names=LAST_RESULTS.get("class_names", []),
+            report_text=report_text,
+            accuracy=accuracy,
+            output_dir="."
+        )
+    else:
+        path = export_results_pdf(
+            summary_md=summary,
+            fig_acc=fig_acc,
+            fig_cm=fig_cm,
+            accuracy=accuracy,
+            output_dir="."
+        )
 
     progress(1.0, desc="Done")
-
-    acc_text = f" · Acc {accuracy:.2f}%" if accuracy is not None else ""
-    status = f"✓ Loaded {model_name} ({len(class_names)} classes){acc_text}"
-    return status, f"**Model loaded successfully**\n\n- Model: `{model_name}`\n- Classes: {', '.join(class_names)}\n- Ready for prediction"
+    return path
 
 
 # ====================== UI ======================
@@ -474,9 +195,7 @@ html, body, .gradio-container {
     padding: 12px 28px 20px 28px !important;
 }
 footer {display:none !important;}
-.main-row {
-    gap: 16px !important;
-}
+.main-row { gap: 16px !important; }
 """
 
 theme = gr.themes.Base(
@@ -494,18 +213,15 @@ theme = gr.themes.Base(
     button_primary_background_fill_hover="#6d28d9",
 )
 
-with gr.Blocks(
-    title="Image Classification",
-    fill_width=True
-) as demo:
+with gr.Blocks(title="Image Classification", fill_width=True) as demo:
 
     gr.Markdown("""
     <div style="padding: 8px 0 4px 0;">
-        <h1 style="margin:0; font-size:1.7rem; font-weight:650; color:#f8fafc; letter-spacing:-0.02em;">
+        <h1 style="margin:0; font-size:1.7rem; font-weight:650; color:#f8fafc;">
             Image Classification
         </h1>
         <p style="margin:4px 0 0 0; color:#94a3b8; font-size:0.93rem;">
-            Train EfficientNet models on any image folder · Local & private
+            Train EfficientNet models on any image folder · Optional Cleanlab · Local & private
         </p>
     </div>
     """)
@@ -514,7 +230,7 @@ with gr.Blocks(
 
     with gr.Row(elem_classes=["main-row"], equal_height=False):
 
-        # LEFT
+        # ---------- LEFT PANEL ----------
         with gr.Column(scale=1, min_width=320):
 
             with gr.Group():
@@ -522,6 +238,7 @@ with gr.Blocks(
                 folder_input = gr.Textbox(
                     label="Folder path",
                     placeholder=r"D:\Datasets\my_dataset",
+                    value=load_last_folder(),
                     lines=1
                 )
                 analyze_btn = gr.Button("Analyze Folder", variant="primary")
@@ -542,12 +259,18 @@ with gr.Blocks(
 
             with gr.Group():
                 gr.Markdown("#### Load Model")
-                model_upload = gr.File(
-                    label="Upload trained model (.pth)",
-                    file_types=[".pth"],
-                    type="filepath"
-                )
+                model_upload = gr.File(label="Upload trained model (.pth)", file_types=[".pth"], type="filepath")
                 load_btn = gr.Button("Load Model", variant="secondary")
+
+            with gr.Group():
+                gr.Markdown("#### Cleanlab (Optional)")
+                clean_scope = gr.Dropdown(
+                    choices=["Train only", "Test only", "Both"],
+                    value="Both",
+                    label="Analyze"
+                )
+                clean_btn = gr.Button("Find & Clean Mislabelled Images", variant="secondary")
+                cleaned_path_box = gr.Textbox(label="Cleaned dataset path", interactive=False)
 
             with gr.Accordion("Notes", open=True):
                 gr.Markdown("""
@@ -556,11 +279,11 @@ with gr.Blocks(
 - Stage 1: train classifier head only
 - Stage 2: fine-tune last blocks
 - Class imbalance handled automatically
+- Cleanlab creates a **new** folder (original stays safe)
 - 4 GB VRAM → use B0/B1, batch ≤ 32
-- After training you can download the model and load it later
                 """)
 
-        # RIGHT
+        # ---------- RIGHT PANEL ----------
         with gr.Column(scale=3):
 
             with gr.Group():
@@ -569,6 +292,11 @@ with gr.Blocks(
                 train_status = gr.Markdown("")
                 model_status = gr.Textbox(label="Model", value="No model yet", interactive=False)
                 model_download = gr.File(label="Download Trained Model", interactive=False)
+
+                with gr.Row():
+                    export_format = gr.Dropdown(choices=["CSV", "PDF"], value="CSV", label="Export format")
+                    export_btn = gr.Button("Export Results", variant="secondary")
+                export_file = gr.File(label="Exported file", interactive=False)
 
                 with gr.Row():
                     acc_plot = gr.Plot(label="Accuracy")
@@ -590,30 +318,49 @@ with gr.Blocks(
     </div>
     """)
 
+    # ---------- Events ----------
     analyze_btn.click(
-        fn=analyze_folder,
+        fn=ui_analyze_folder,
         inputs=[folder_input],
         outputs=[dataset_summary, dataset_status]
     )
 
     train_btn.click(
-        fn=train_model,
+        fn=ui_train,
         inputs=[model_choice, epochs1, epochs2, batch_size],
         outputs=[train_status, acc_plot, cm_plot, model_status, model_download]
     )
 
     load_btn.click(
-        fn=load_model,
+        fn=ui_load_model,
         inputs=[model_upload],
         outputs=[model_status, train_status]
     )
 
+    clean_btn.click(
+        fn=ui_cleanlab,
+        inputs=[clean_scope],
+        outputs=[train_status, cleaned_path_box]
+    )
+
     predict_btn.click(
-        fn=predict_image,
+        fn=ui_predict,
         inputs=[input_img],
         outputs=[pred_out, pred_plot]
     )
 
+    export_btn.click(
+        fn=ui_export,
+        inputs=[export_format],
+        outputs=[export_file]
+    )
+
 
 if __name__ == "__main__":
-    demo.queue().launch(server_name="0.0.0.0", server_port=7860, share=False, theme=theme, css=css)
+    demo.queue().launch(
+        server_name="0.0.0.0",
+        server_port=7860,
+        share=False,
+        theme=theme,
+        css=css
+    )

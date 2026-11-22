@@ -1,151 +1,113 @@
 # Image Classification App
 
-A clean local web application to train and test **EfficientNet** models on any image classification dataset.
-
-Works with any classes (emotions, cars, animals, gender, etc.) as long as your folder has the correct structure.
+A clean, modular local web app to train **EfficientNet** models on any image classification dataset, with optional **Cleanlab** support for finding mislabelled images.
 
 ---
 
 ## Features
 
-- Copy and Paste the local dataset folder (no need to zip)
-- Choose between EfficientNet-B0 / B1 / B2 / B3
-- Two-stage transfer learning (Stage 1 + Stage 2)
+- Works with **any** classes (emotions, cars, animals, etc.)
+- EfficientNet-B0 / B1 / B2 / B3
+- Two-stage transfer learning
 - Automatic class imbalance handling
-- Live prediction on your own images
-- Accuracy curve + Confusion matrix
+- **Save & Load** trained models
+- Optional **Cleanlab** – find and remove mislabelled images
+- Creates a new cleaned dataset (original stays safe)
+- Remembers last used folder path
+- Training progress with ETA
+- Export results as **CSV** or **PDF**
+- Live prediction
 - Fully local & private
 
 ---
 
-## Dataset Structure
+## Project Structure
 
-Your dataset folder must look like this:
+```
+image-classification-app/
+├── app.py              # Gradio UI
+├── training.py         # Model training & prediction
+├── cleaning.py         # Cleanlab logic
+├── utils.py            # Helpers & transforms
+├── requirements.txt
+├── README.md
+└── .gitignore
+```
+
+---
+
+## Dataset Structure
 
 ```
 my_dataset/
 ├── train/
 │   ├── class1/
 │   ├── class2/
-│   ├── class3/
 │   └── ...
 └── test/
     ├── class1/
     ├── class2/
-    ├── class3/
     └── ...
 ```
 
 ---
 
-## Requirements
-
-- Windows / Linux / macOS
-- Python 3.10 or higher
-- NVIDIA GPU recommended (RTX 3050 Ti or better works well)
-
----
-
-## Installation (Step by Step)
-
-### 1. Open terminal in the project folder
+## Installation
 
 ```bash
-cd path\to\image-classification-app
-```
+# 1. Go to project folder
+cd image-classification-app
 
-### 2. Create a virtual environment
-
-```bash
+# 2. Create virtual environment
 python -m venv venv
-```
 
-### 3. Activate the virtual environment
-
-**Windows:**
-```bash
+# 3. Activate it
+# Windows:
 venv\Scripts\activate
-```
-
-**Mac / Linux:**
-```bash
+# Mac/Linux:
 source venv/bin/activate
-```
 
-You should see `(venv)` at the beginning of the line.
-
-### 4. Install dependencies
-
-```bash
+# 4. Install dependencies
 pip install -r requirements.txt
-```
 
-### 5. Install PyTorch with GPU support (Recommended)
-
-```bash
+# 5. Install PyTorch with GPU support (recommended)
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 ```
 
-> If you only have CPU, use:
-> ```bash
-> pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-> ```
-
-### 6. Verify GPU is detected (optional but recommended)
-
-```bash
-python -c "import torch; print(torch.__version__); print('CUDA available:', torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'No GPU')"
-```
-
-You should see `CUDA available: True` and your GPU name.
-
 ---
 
-## Running the App
-
-Make sure the virtual environment is activated (`(venv)` is visible), then run:
+## Run the App
 
 ```bash
 python app.py
 ```
 
-Open your browser and go to:
-
-**http://localhost:7860**
+Open: **http://localhost:7860**
 
 ---
 
 ## How to Use
 
-1. **Dataset tab (left side)**
-   - Copy paste the location of your dataset folder
-   - Click **Analyze Folder**
-
-2. **Training Settings**
-   - Choose model (EfficientNet-B0 is recommended)
-   - Set Stage 1 and Stage 2 epochs
-   - Adjust Batch Size if needed (32 is good for 4–6 GB VRAM)
-   - Click **Start Training**
-
-3. **Results**
-   - View accuracy curve and confusion matrix after training finishes
-
-4. **Live Prediction**
-   - Upload any image to see the predicted class + confidence
+1. Paste the full path to your dataset folder → click **Analyze Folder**
+2. Choose model & epochs → click **Start Training**
+3. (Optional) Use **Cleanlab** to find mislabelled images and create a cleaned dataset
+4. Download the trained model (`.pth`) so you can load it later
+5. Export results as CSV or PDF if needed
+6. Use **Live Prediction** to test any image
 
 ---
 
-## Notes
+## Cleanlab Notes
 
-- **Stage 1**: Trains only the final classifier layer (fast)
-- **Stage 2**: Fine-tunes the last blocks of the network (improves accuracy)
-- Class imbalance is handled automatically using class weights
-- On 4 GB VRAM (e.g. RTX 3050 Ti), stay with EfficientNet-B0 or B1 and batch size ≤ 32
+- Cleanlab needs a trained model first
+- It creates a **new folder** (`your_dataset_cleaned/`) – original is never modified
+- You can choose to analyze Train only / Test only / Both
+- After cleaning, point the app to the new cleaned folder and train again
 
 ---
 
 ## Credits
 
 Made by [yugisch](https://github.com/yugisch)  
-Built with Grok Agent  
+Built with Grok  
 Runs fully locally
